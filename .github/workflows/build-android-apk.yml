@@ -104,6 +104,41 @@ jobs:
             ./gradlew --no-daemon :app:assembleDebug
           fi
 
+      - name: Sign APK
+        working-directory: apps/android
+        run: |
+          BUILD_TYPE="${{ steps.config.outputs.build_type }}"
+          APK_DIR="app/build/outputs/apk/${BUILD_TYPE}"
+          UNSIGNED_APK=$(find "${APK_DIR}" -name "*.apk" -type f | head -n 1)
+
+          if [ -z "$UNSIGNED_APK" ]; then
+            echo "Error: No APK found to sign"
+            exit 1
+          fi
+
+          # Create debug keystore if not exists (for signing)
+          KEYSTORE_PATH="$HOME/.android/debug.keystore"
+          if [ ! -f "$KEYSTORE_PATH" ]; then
+            mkdir -p "$HOME/.android"
+            keytool -genkey -v -keystore "$KEYSTORE_PATH" -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+          # Sign the APK
+          SIGNED_APK="${UNSIGNED_APK%.apk}-signed.apk"
+          $ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner sign \
+            --ks "$KEYSTORE_PATH" \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --in "$UNSIGNED_APK" \
+            --out "$SIGNED_APK"
+
+          # Replace unsigned with signed
+          mv "$SIGNED_APK" "$UNSIGNED_APK"
+
+          # Verify signing
+          $ANDROID_SDK_ROOT/build-tools/36.0.0/apksigner verify "$UNSIGNED_APK"
+          echo "APK signed successfully"
+
       - name: Locate built APK
         id: locate
         working-directory: apps/android
