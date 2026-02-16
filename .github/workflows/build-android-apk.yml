@@ -1,0 +1,200 @@
+name: Build Android APK
+
+# Trigger options:
+# 1. workflow_dispatch - Manual trigger from GitHub Actions tab
+# 2. schedule - Weekly builds (Sunday at 2 AM UTC)
+# 3. push - Optional: Build on tags starting with 'android-'
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Build type"
+        required: true
+        default: "debug"
+        type: choice
+        options:
+          - debug
+          - release
+      create_release:
+        description: "Create GitHub Release"
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: "Release tag (optional, defaults to android-build-YYYYMMDD)"
+        required: false
+        type: string
+  schedule:
+    # Run weekly on Sunday at 2:00 AM UTC
+    - cron: "0 2 * * 0"
+  push:
+    tags:
+      - "android-*"
+      - "v*"
+
+# Prevent concurrent runs of this workflow
+concurrency:
+  group: android-apk-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  build-android-apk:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required for creating releases
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: false
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.11.1
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+
+      - name: Determine build type
+        id: config
+        run: |
+          # Set build type from input or default to debug
+          BUILD_TYPE="${{ github.event.inputs.build_type || 'debug' }}"
+          echo "build_type=$BUILD_TYPE" >> "$GITHUB_OUTPUT"
+
+          # Extract version from build.gradle.kts
+          VERSION_NAME=$(grep -oP 'versionName = "\K[^"]+' apps/android/app/build.gradle.kts || echo "unknown")
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+
+          # Generate timestamp
+          TIMESTAMP=$(date +'%Y%m%d')
+          echo "timestamp=$TIMESTAMP" >> "$GITHUB_OUTPUT"
+
+          # Set APK name pattern
+          APK_NAME="openclaw-${VERSION_NAME}-${BUILD_TYPE}.apk"
+          echo "apk_name=$APK_NAME" >> "$GITHUB_OUTPUT"
+
+          echo "Building OpenClaw Android $BUILD_TYPE APK version $VERSION_NAME"
+
+      - name: Build APK
+        working-directory: apps/android
+        run: |
+          if [ "${{ steps.config.outputs.build_type }}" = "release" ]; then
+            ./gradlew --no-daemon :app:assembleRelease
+          else
+            ./gradlew --no-daemon :app:assembleDebug
+          fi
+
+      - name: Locate built APK
+        id: locate
+        working-directory: apps/android
+        run: |
+          BUILD_TYPE="${{ steps.config.outputs.build_type }}"
+          APK_DIR="app/build/outputs/apk/${BUILD_TYPE}"
+
+          # Find the APK file
+          APK_PATH=$(find "${APK_DIR}" -name "*.apk" -type f | head -n 1)
+
+          if [ -z "$APK_PATH" ]; then
+            echo "Error: No APK file found in ${APK_DIR}"
+            exit 1
+          fi
+
+          echo "Found APK: $APK_PATH"
+          echo "apk_path=$APK_PATH" >> "$GITHUB_OUTPUT"
+          echo "apk_full_path=${{ github.workspace }}/apps/android/${APK_PATH}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload APK as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-android-${{ steps.config.outputs.build_type }}-${{ steps.config.outputs.timestamp }}
+          path: ${{ steps.locate.outputs.apk_full_path }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          VERSION="${{ steps.config.outputs.version_name }}"
+          BUILD_TYPE="${{ steps.config.outputs.build_type }}"
+          TIMESTAMP="${{ steps.config.outputs.timestamp }}"
+          SHA="${{ github.sha }}"
+          SHORT_SHA="${SHA:0:7}"
+
+          cat > release_notes.md << EOF
+          # OpenClaw Android ${BUILD_TYPE^} Build
+
+          **Version:** ${VERSION}  
+          **Build Type:** ${BUILD_TYPE}  
+          **Build Date:** $(date -u +'%Y-%m-%d %H:%M UTC')  
+          **Commit:** ${SHORT_SHA}
+
+          ## Installation
+
+          1. Download the APK file from the Assets section below
+          2. Transfer it to your Android device
+          3. Enable "Install from Unknown Sources" in your device settings
+          4. Tap the APK file to install
+
+          ## Requirements
+
+          - Android 12+ (API level 31)
+          - ~50 MB storage space
+
+          ## Changes
+
+          See the [commit history](https://github.com/${{ github.repository }}/commits/${{ github.sha }}) for details.
+          EOF
+
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        if: github.event.inputs.create_release == 'true' || startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OpenClaw Android ${{ steps.config.outputs.version_name }}-${{ steps.config.outputs.timestamp }}
+          tag_name: ${{ github.event.inputs.release_tag || format('android-build-{0}', steps.config.outputs.timestamp) }}
+          body_path: release_notes.md
+          files: ${{ steps.locate.outputs.apk_full_path }}
+          make_latest: ${{ github.event.inputs.build_type == 'release' && github.event.inputs.create_release == 'true' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Summary
+        run: |
+          echo "## ✅ Android Build Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Property | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Version** | ${{ steps.config.outputs.version_name }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Build Type** | ${{ steps.config.outputs.build_type }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **APK Name** | ${{ steps.config.outputs.apk_name }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Artifact** | openclaw-android-${{ steps.config.outputs.build_type }}-${{ steps.config.outputs.timestamp }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 📥 Download" >> "$GITHUB_STEP_SUMMARY"
+          echo "The APK is available as an artifact and can be downloaded from this workflow run." >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${{ github.event.inputs.create_release }}" = "true" ] || [ "${{ startsWith(github.ref, 'refs/tags/') }}" = "true" ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "### 🎉 Release Created" >> "$GITHUB_STEP_SUMMARY"
+            echo "A GitHub Release has been created with the APK attached." >> "$GITHUB_STEP_SUMMARY"
+          fi
